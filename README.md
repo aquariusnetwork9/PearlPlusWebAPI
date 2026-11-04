@@ -12,7 +12,7 @@ Requires [PearlPlus](https://github.com/duccss/PearlPlus) or [PearlPlus-ng](http
 |---|---|---|
 | Auth | One shared token that can load **any** player's pearls | One token **per player**, which only works for that player's own pearls. The old master token can be turned off |
 | Tokens | A long random value | **7 characters**, easy to type, with no look-alike characters (no `0/O`, `1/l/I`) |
-| Token storage | Plain text in the config, printed at startup, and shown in every `ppApi` reply (which ZenithProxy mirrors to Discord) | SHA-256 hashes only. A new token is printed once, to the console log only, never to Discord |
+| Token storage | Plain text in the config, printed at startup, and shown in every `ppApi` reply (which ZenithProxy mirrors to Discord) | SHA-256 hashes only. The master token is never shown in `ppApi` replies. A new player token is shown once, in the command reply and the console log |
 | Token guessing | Only the per-IP limit | A global cap on failed logins (default 60 a minute across all IPs). Valid tokens keep working during a lockout |
 | Rate limit | Per IP. Behind a reverse proxy or Cloudflare Tunnel, every player shares one bucket | Per token. Unauthenticated callers are limited per IP, using `CF-Connecting-IP` when behind a local tunnel |
 | Input | `playerName` and `pearlId` were pasted straight into the `pp load` command | Both are validated: Minecraft-name format, and pearl IDs with no spaces or quotes |
@@ -37,12 +37,14 @@ Run these in the ZenithProxy console (or anywhere you can run owner commands):
 
 | Command | What it does |
 |---|---|
-| `ppApi user add <mcName>` | Creates a token for that player. It is printed **once**, to the console log only |
+| `ppApi user add <mcName>` | Creates a token for that player and shows it **once**, in the command reply (so the bot's Discord log keeps a copy) and in the console log |
 | `ppApi user reset <mcName>` | Replaces a player's token (lost or leaked). The old one stops working |
 | `ppApi user remove <mcName>` | Revokes a player's access |
 | `ppApi user list` | Lists players who have tokens |
 | `ppApi masterToken off` | Disables the all-players master token. Recommended once players have their own tokens |
 | `ppApi auth regenerate` | Makes a new master token, printed to the console log only |
+
+**Keep the bot's Discord channel admin-only.** ZenithProxy mirrors command replies there, so it records every token you issue.
 
 Give each player:
 - the API URL (for example `https://pearl.example.com`)

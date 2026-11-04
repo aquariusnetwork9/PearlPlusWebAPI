@@ -27,8 +27,8 @@ public class PPApiCommand extends Command {
             .category(CommandCategory.MODULE)
             .description("""
                 Manages the PP API for interacting with this ZenithProxy instance.
-                Per-user tokens only work for that player's own pearls. New tokens are printed
-                to the console log only (never to Discord) and are shown once.
+                Per-user tokens only work for that player's own pearls. A new token is shown once,
+                in this reply (so the admin Discord log keeps it) and in the console log.
                 """)
             .usageLines(
                 "on/off",
@@ -135,8 +135,10 @@ public class PPApiCommand extends Command {
         LOG.info("PP API token for {} (only works for {}'s pearls): {}", player, player, token);
         c.getSource().getEmbed()
             .title(existed ? "PP API Token Replaced" : "PP API Token Created")
-            .description("Token for **" + player + "** was written to the console log only (not Discord)."
-                + (existed ? " Their old token no longer works." : ""));
+            .description("Token for **" + player + "** (only works for their own pearls)."
+                + (existed ? " Their old token no longer works." : ""))
+            // Shown in the reply so the bot's Discord log (admin-only channel) keeps a record of it.
+            .addField("Token", "`" + token + "`");
     }
 
     @Override
