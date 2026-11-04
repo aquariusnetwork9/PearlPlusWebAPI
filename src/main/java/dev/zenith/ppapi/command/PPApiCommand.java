@@ -36,6 +36,8 @@ public class PPApiCommand extends Command {
                 "auth <token>",
                 "auth regenerate",
                 "masterToken on/off",
+                "selfService on/off",
+                "selfService cooldown <minutes>",
                 "user add <playerName>",
                 "user reset <playerName>",
                 "user remove <playerName>",
@@ -81,6 +83,17 @@ public class PPApiCommand extends Command {
                     c.getSource().getEmbed()
                         .title("PP API Auth Token Set");
                 })))
+            .then(literal("selfService")
+                .then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.selfServiceEnabled = getToggle(c, "toggle");
+                    c.getSource().getEmbed()
+                        .title("Self-Service Tokens " + toggleStrCaps(PLUGIN_CONFIG.selfServiceEnabled));
+                }))
+                .then(literal("cooldown").then(argument("minutes", integer(0)).executes(c -> {
+                    PLUGIN_CONFIG.selfServiceCooldownMinutes = getInteger(c, "minutes");
+                    c.getSource().getEmbed()
+                        .title("Self-Service Cooldown Set");
+                }))))
             .then(literal("masterToken").then(argument("toggle", toggle()).executes(c -> {
                 PLUGIN_CONFIG.masterTokenEnabled = getToggle(c, "toggle");
                 c.getSource().getEmbed()
@@ -148,6 +161,8 @@ public class PPApiCommand extends Command {
             .addField("Port", PLUGIN_CONFIG.port)
             .addField("Master Token", PLUGIN_CONFIG.masterTokenEnabled ? "Enabled (hidden)" : "Disabled")
             .addField("Per-User Tokens", UserTokens.listPlayers().size())
+            .addField("Self-Service Tokens", PLUGIN_CONFIG.selfServiceEnabled
+                ? "On (" + PLUGIN_CONFIG.selfServiceCooldownMinutes + " min cooldown)" : "Off")
             .addField("Commands Account Owner Perms", PLUGIN_CONFIG.commandsAccountOwnerPerms)
             .addField("Rate Limiter", toggleStr(PLUGIN_CONFIG.rateLimiter))
             .addField("Rate Limit Requests Per Minute", PLUGIN_CONFIG.rateLimitRequestsPerMinute)

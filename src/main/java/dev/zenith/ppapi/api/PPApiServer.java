@@ -79,6 +79,22 @@ public class PPApiServer {
                     LOG.warn("Denied request from {}: required plugin '{}' not loaded", clientIp(ctx), REQUIRED_PLUGIN_ID);
                     return;
                 }
+                // Self-service token endpoints need no token (they are how a player gets one).
+                // Mojang verifies identity; here we only cap how often one IP may try.
+                if (ctx.path().startsWith("/pearlplus/auth/")) {
+                    if (!PLUGIN_CONFIG.selfServiceEnabled) {
+                        ctx.status(403);
+                        ctx.json(new ApiErrorResponse("Self-service tokens are turned off on this bot. Ask its owner for a token"));
+                        ctx.skipRemainingHandlers();
+                        return;
+                    }
+                    if (isLimited("auth-ip:" + clientIp(ctx), 10)) {
+                        ctx.status(429);
+                        ctx.json(new ApiErrorResponse("Too many token requests, try again in a minute"));
+                        ctx.skipRemainingHandlers();
+                    }
+                    return;
+                }
                 var authHeaderValue = ctx.header("Authorization");
                 var identity = UserTokens.authenticate(authHeaderValue);
                 // Rate limit per authenticated identity; unauthenticated callers share a per-IP bucket.
@@ -188,7 +204,56 @@ public class PPApiServer {
                 var context = executeCommand(command, ctx);
                 ctx.json(new PearlLoadResponse("queued", pearlId, context.getMultiLineOutput()));
                 ctx.status(200);
+            })
+            .post("/pearlplus/auth/challenge", ctx -> {
+                var req = ctx.bodyAsClass(AuthChallengeRequest.class);
+                var playerName = req.playerName() == null ? null : req.playerName().trim();
+                if (playerName == null || !UserTokens.MC_NAME.matcher(playerName).matches()) {
+                    ctx.status(400);
+                    ctx.json(new ApiErrorResponse("playerName is required and must be a valid Minecraft name"));
+                    return;
+                }
+                ctx.json(new AuthChallengeResponse(SelfService.newChallenge(playerName)));
+                ctx.status(200);
+            })
+            .post("/pearlplus/auth/verify", ctx -> {
+                var req = ctx.bodyAsClass(AuthVerifyRequest.class);
+                var playerName = req.playerName() == null ? null : req.playerName().trim();
+                if (playerName == null || !UserTokens.MC_NAME.matcher(playerName).matches()
+                    || req.serverId() == null || req.serverId().isBlank()) {
+                    ctx.status(400);
+                    ctx.json(new ApiErrorResponse("playerName and serverId are required"));
+                    return;
+                }
+                var result = SelfService.verifyAndIssue(playerName, req.serverId().trim(),
+                    name -> {
+                        var snap = readPearlPlus(name);
+                        return snap.error() == null && !snap.pearls().isEmpty();
+                    });
+                if (result.error() != null) {
+                    ctx.status(result.status());
+                    ctx.json(new ApiErrorResponse(result.error()));
+                    LOG.warn("Self-service token refused for {} from {}: {}", playerName, clientIp(ctx), result.error());
+                    return;
+                }
+                ctx.json(new AuthTokenResponse(result.playerName(), result.token()));
+                ctx.status(200);
             });
+    }
+
+    public record AuthChallengeRequest(String playerName) { }
+    public record AuthChallengeResponse(String serverId) { }
+    public record AuthVerifyRequest(String playerName, String serverId) { }
+    public record AuthTokenResponse(String playerName, String token) { }
+
+    /** Simple per-key counter in the shared 1-minute cache. */
+    private boolean isLimited(String key, int perMinute) {
+        synchronized (this) {
+            Integer count = rateLimitCache.getIfPresent(key);
+            int n = count == null ? 0 : count;
+            rateLimitCache.put(key, n + 1);
+            return n >= perMinute;
+        }
     }
 
     private static final String IDENTITY_ATTR = "ppapi.identity";

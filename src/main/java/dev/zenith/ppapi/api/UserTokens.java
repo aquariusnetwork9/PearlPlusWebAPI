@@ -108,6 +108,14 @@ public final class UserTokens {
         }
     }
 
+    /** Epoch millis the player's current token was issued, or 0 if they have none. */
+    public static long issuedAt(String playerName) {
+        synchronized (LOCK) {
+            PPApiConfig.ApiUser user = PLUGIN_CONFIG.users.get(playerName.toLowerCase(Locale.ROOT));
+            return user == null ? 0 : user.createdAt;
+        }
+    }
+
     public static List<String> listPlayers() {
         synchronized (LOCK) {
             List<String> names = new ArrayList<>();

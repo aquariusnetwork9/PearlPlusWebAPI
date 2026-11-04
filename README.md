@@ -20,6 +20,7 @@ Requires [PearlPlus](https://github.com/duccss/PearlPlus) or [PearlPlus-ng](http
 | Unknown pearl | Queued anyway, then fails inside PearlPlus | `404` that lists the player's pearls |
 | Bot offline / in queue | Load queued anyway | `503 Bot is not connected` |
 | `status` response | pearls, bot, server, connected | Also `loadCommand` (the bot's whisper load word) and `defaultPearlId`, which the mod uses to intercept whispers |
+| Getting a token | The owner copies the one shared token to everyone | **Self-service:** the mod proves the player owns their Minecraft account through Mojang, and anyone with at least one registered pearl gets their own token. The owner doesn't have to do anything |
 | Logging | Command only | Command, which player's token was used, and the real client IP |
 
 Existing upstream configs keep working: the master token is still accepted until you turn it off.
@@ -31,7 +32,23 @@ Existing upstream configs keep working: the master token is still accepted until
 3. The API starts on port `8080`. Change it with `ppApi port <port>`.
 4. Make it reachable over **HTTPS**. Tokens are sent in a header, so don't expose plain HTTP to the internet. A Cloudflare Tunnel (`hostname -> http://127.0.0.1:8080`) or any reverse proxy with TLS works.
 
-## Setting up players
+## Self-service tokens (default: on)
+
+Players with the matching mod click **Get my token automatically** in its settings. It works like the check a Minecraft server does when you join:
+
+1. The mod asks `POST /pearlplus/auth/challenge` for a one-time code (the `serverId`).
+2. The mod tells Mojang's session server it is "joining" that code, using the player's normal game login. That login only ever goes to Mojang.
+3. The mod calls `POST /pearlplus/auth/verify`. The plugin asks Mojang's `hasJoined` endpoint whether that player really joined with that code. Mojang confirms the exact account name.
+4. If that player has **at least one pearl registered** in PearlPlus on this bot, the plugin issues their 7-character token and returns it to the mod.
+
+Each code works once and expires after 2 minutes. Each IP may make 10 token requests a minute. A player can get a replacement token every 10 minutes, and the replacement cancels their old token. Every self-service token is posted to the bot's console and Discord log as a "Token Created (self-service)" message.
+
+| Command | What it does |
+|---|---|
+| `ppApi selfService on/off` | Allow or stop self-service tokens. Manual `ppApi user add` always works |
+| `ppApi selfService cooldown <minutes>` | Minimum time between replacement tokens for one player (default 10) |
+
+## Setting up players by hand
 
 Run these in the ZenithProxy console (or anywhere you can run owner commands):
 
@@ -87,6 +104,10 @@ Every request is a `POST` with a JSON body and an `Authorization: <token>` heade
 ```json
 { "status": "queued", "pearlId": "stash", "output": [] }
 ```
+
+### `POST /pearlplus/auth/challenge` and `/pearlplus/auth/verify`
+
+These are the self-service endpoints described above and need no `Authorization` header. A challenge request is `{"playerName": "Steve"}` and returns `{"serverId": "..."}`. A verify request is `{"playerName": "Steve", "serverId": "..."}` and returns `{"playerName": "Steve", "token": "Ab3xK9m"}`. Verify fails with 400 (bad or expired code), 403 (Mojang didn't confirm the player, or they have no pearls on this bot), 429 (cooldown) or 502 (Mojang unreachable).
 
 ### Errors
 

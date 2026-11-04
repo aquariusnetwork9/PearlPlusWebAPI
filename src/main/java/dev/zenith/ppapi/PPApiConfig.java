@@ -16,6 +16,10 @@ public class PPApiConfig {
     /** Failed logins allowed per minute across ALL callers before bad tokens get 429. Stops token guessing. 0 = off. */
     public int authFailuresPerMinute = 60;
     public boolean commandsAccountOwnerPerms = false;
+    /** Players with at least one registered pearl can get their own token from the mod (Mojang-verified). */
+    public boolean selfServiceEnabled = true;
+    /** Minimum minutes between self-service tokens for the same player. */
+    public int selfServiceCooldownMinutes = 10;
     /** Per-user tokens, keyed by lowercase Minecraft name. Only a SHA-256 hash of each token is stored. */
     public Map<String, ApiUser> users = new LinkedHashMap<>();
 
