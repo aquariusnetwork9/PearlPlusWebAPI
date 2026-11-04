@@ -13,6 +13,7 @@ import dev.zenith.ppapi.api.model.PearlLoadResponse;
 import dev.zenith.ppapi.api.model.PearlStatusRequest;
 import dev.zenith.ppapi.api.model.PearlStatusResponse;
 import io.javalin.Javalin;
+import io.javalin.http.Context;
 import io.javalin.json.JavalinJackson;
 import org.eclipse.jetty.util.thread.ExecutorThreadPool;
 
@@ -21,6 +22,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 import static dev.zenith.ppapi.PPApiPlugin.LOG;
 import static dev.zenith.ppapi.PPApiPlugin.PLUGIN_CONFIG;
@@ -43,7 +45,7 @@ public class PPApiServer {
         server = createServer();
         server.start(PLUGIN_CONFIG.port);
         LOG.info("PP API started on port {}", PLUGIN_CONFIG.port);
-        LOG.info("Auth token: {}", PLUGIN_CONFIG.authToken);
+        LOG.info("Master token {}; {} per-user token(s) configured", PLUGIN_CONFIG.masterTokenEnabled ? "enabled" : "disabled", PLUGIN_CONFIG.users.size());
     }
 
     public synchronized void stop() {
@@ -70,34 +72,36 @@ public class PPApiServer {
                 config.jsonMapper(new JavalinJackson(objectMapper, false));
             })
             .beforeMatched(ctx -> {
-                if (PLUGIN_CONFIG.rateLimiter) {
-                    String ip = ctx.ip();
-                    synchronized (this) {
-                        int reqCount = rateLimitCache.get(ip, () -> 0);
-                        rateLimitCache.put(ip, reqCount + 1);
-                        if (reqCount >= PLUGIN_CONFIG.rateLimitRequestsPerMinute) {
-                            ctx.status(429);
-                            ctx.json(new ApiErrorResponse("Rate limit exceeded"));
-                            ctx.skipRemainingHandlers();
-                            LOG.warn("Rate limit exceeded for IP: {}", ip);
-                            return;
-                        }
-                    }
-                }
                 if (!isRequiredPluginAvailable()) {
                     ctx.status(503);
                     ctx.json(new ApiErrorResponse("Required plugin is not loaded"));
                     ctx.skipRemainingHandlers();
-                    LOG.warn("Denied request from {}: required plugin '{}' not loaded", ctx.ip(), REQUIRED_PLUGIN_ID);
+                    LOG.warn("Denied request from {}: required plugin '{}' not loaded", clientIp(ctx), REQUIRED_PLUGIN_ID);
                     return;
                 }
                 var authHeaderValue = ctx.header("Authorization");
-                if (authHeaderValue != null) {
-                    var expectedHeaderValue = PLUGIN_CONFIG.authToken;
-                    if (authHeaderValue.equals(expectedHeaderValue)) {
-                        // ok
-                        return;
-                    }
+                var identity = UserTokens.authenticate(authHeaderValue);
+                // Rate limit per authenticated identity; unauthenticated callers share a per-IP bucket.
+                var rateKey = identity != null ? identity.rateLimitKey() : "ip:" + clientIp(ctx);
+                if (isRateLimited(rateKey)) {
+                    ctx.status(429);
+                    ctx.json(new ApiErrorResponse("Rate limit exceeded"));
+                    ctx.skipRemainingHandlers();
+                    LOG.warn("Rate limit exceeded for {} ({})", rateKey, clientIp(ctx));
+                    return;
+                }
+                if (identity != null) {
+                    ctx.attribute(IDENTITY_ATTR, identity);
+                    return;
+                }
+                // Global cap on failed logins (all IPs together). Tokens are short, so this is what
+                // makes guessing them impractical even from many IPs. Valid tokens are never affected.
+                if (isAuthFailureLimited()) {
+                    ctx.status(429);
+                    ctx.json(new ApiErrorResponse("Too many failed logins, try again in a minute"));
+                    ctx.skipRemainingHandlers();
+                    LOG.warn("Failed-login limit reached; rejected request from {}", clientIp(ctx));
+                    return;
                 }
                 String reason = authHeaderValue == null
                     ? "Authorization header missing"
@@ -105,55 +109,148 @@ public class PPApiServer {
                 ctx.json(new ApiErrorResponse(reason));
                 ctx.status(401);
                 ctx.skipRemainingHandlers();
-                LOG.warn("Denied request from {}: {}", ctx.ip(), reason);
+                LOG.warn("Denied request from {}: {}", clientIp(ctx), reason);
             })
             .post("/pearlplus/status", ctx -> {
                 var req = ctx.bodyAsClass(PearlStatusRequest.class);
-                var playerName = req.playerName();
-                if (playerName == null || playerName.isBlank()) {
+                var playerName = req.playerName() == null ? null : req.playerName().trim();
+                if (playerName == null || !UserTokens.MC_NAME.matcher(playerName).matches()) {
                     ctx.status(400);
-                    ctx.json(new ApiErrorResponse("playerName is required"));
+                    ctx.json(new ApiErrorResponse("playerName is required and must be a valid Minecraft name"));
                     return;
                 }
-                var result = readPearlsFromConfig(playerName);
-                if (result.error() != null) {
+                if (!checkAccess(ctx, playerName)) return;
+                var snap = readPearlPlus(playerName);
+                if (snap.error() != null) {
                     ctx.status(500);
-                    ctx.json(new ApiErrorResponse(result.error()));
+                    ctx.json(new ApiErrorResponse(snap.error()));
                     return;
                 }
                 var botInfo = readZenithBotInfo();
                 ctx.json(new PearlStatusResponse(
-                    result.pearls(),
-                    result.output(),
+                    snap.pearls(),
+                    List.of("Loaded pearls from PearlPlus config"),
                     botInfo.minecraftServer(),
                     botInfo.botUsername(),
-                    botInfo.botConnected()
+                    botInfo.botConnected(),
+                    snap.loadCommand(),
+                    snap.resolveDefault()
                 ));
                 ctx.status(200);
             })
             .post("/pearlplus/load", ctx -> {
                 var req = ctx.bodyAsClass(PearlLoadRequest.class);
-                var playerName = req.playerName();
-                var pearlId = req.pearlId();
-                if (playerName == null || playerName.isBlank() || pearlId == null || pearlId.isBlank()) {
+                var playerName = req.playerName() == null ? null : req.playerName().trim();
+                var pearlId = req.pearlId() == null ? null : req.pearlId().trim();
+                if (pearlId != null && pearlId.isEmpty()) pearlId = null;
+                if (playerName == null || !UserTokens.MC_NAME.matcher(playerName).matches()
+                    || (pearlId != null && !PEARL_ID.matcher(pearlId).matches())) {
                     ctx.status(400);
-                    ctx.json(new ApiErrorResponse("playerName and pearlId are required"));
+                    ctx.json(new ApiErrorResponse("playerName is required; pearlId must have no spaces or quotes"));
                     return;
                 }
+                if (!checkAccess(ctx, playerName)) return;
+                var snap = readPearlPlus(playerName);
+                if (snap.error() != null) {
+                    ctx.status(500);
+                    ctx.json(new ApiErrorResponse(snap.error()));
+                    return;
+                }
+                if (!Proxy.getInstance().isConnected()) {
+                    ctx.status(503);
+                    ctx.json(new ApiErrorResponse("Bot is not connected to the server (offline or in queue)"));
+                    return;
+                }
+                if (snap.pearls().isEmpty()) {
+                    ctx.status(404);
+                    ctx.json(new ApiErrorResponse("No pearls registered for " + playerName));
+                    return;
+                }
+                if (pearlId == null) {
+                    // Bare "load": same rule as whispering "load" with no id.
+                    pearlId = snap.resolveDefault();
+                    if (pearlId == null) {
+                        ctx.status(400);
+                        ctx.json(new ApiErrorResponse("You have several pearls, pick one: " + String.join(", ", snap.pearls())));
+                        return;
+                    }
+                } else {
+                    String wanted = pearlId;
+                    var match = snap.pearls().stream().filter(x -> x.equalsIgnoreCase(wanted)).findFirst();
+                    if (match.isEmpty()) {
+                        ctx.status(404);
+                        ctx.json(new ApiErrorResponse("No pearl named " + wanted + ". Your pearls: " + String.join(", ", snap.pearls())));
+                        return;
+                    }
+                    pearlId = match.get();
+                }
                 var command = "pp load " + playerName + " " + pearlId;
-                var context = executeCommand(command);
-                ctx.json(new PearlLoadResponse("queued", context.getMultiLineOutput()));
+                var context = executeCommand(command, ctx);
+                ctx.json(new PearlLoadResponse("queued", pearlId, context.getMultiLineOutput()));
                 ctx.status(200);
             });
+    }
+
+    private static final String IDENTITY_ATTR = "ppapi.identity";
+    private static final Pattern PEARL_ID = Pattern.compile("^[^\\s\"'\\\\]{1,64}$");
+
+    /** Per-user tokens may only touch their own player's pearls; the master token may touch any. */
+    private boolean checkAccess(Context ctx, String playerName) {
+        UserTokens.Identity identity = ctx.attribute(IDENTITY_ATTR);
+        if (identity != null && identity.mayAccess(playerName)) return true;
+        ctx.status(403);
+        ctx.json(new ApiErrorResponse("This token can only access pearls for "
+            + (identity == null ? "nobody" : identity.playerName())));
+        LOG.warn("Denied request from {}: token for {} tried to access {}", clientIp(ctx),
+            identity == null ? "?" : identity.playerName(), playerName);
+        return false;
+    }
+
+    /** Counts this failed login; true once the global per-minute failure budget is used up. */
+    private boolean isAuthFailureLimited() {
+        int limit = PLUGIN_CONFIG.authFailuresPerMinute;
+        if (limit <= 0) return false;
+        synchronized (this) {
+            Integer count = rateLimitCache.getIfPresent("authfail");
+            int n = count == null ? 0 : count;
+            rateLimitCache.put("authfail", n + 1);
+            return n >= limit;
+        }
+    }
+
+    private boolean isRateLimited(String key) {
+        if (!PLUGIN_CONFIG.rateLimiter) return false;
+        synchronized (this) {
+            int reqCount;
+            try {
+                reqCount = rateLimitCache.get(key, () -> 0);
+            } catch (Exception e) {
+                reqCount = 0;
+            }
+            rateLimitCache.put(key, reqCount + 1);
+            return reqCount >= PLUGIN_CONFIG.rateLimitRequestsPerMinute;
+        }
+    }
+
+    /** Real client IP. Behind cloudflared every request comes from loopback, so trust CF-Connecting-IP only then. */
+    private static String clientIp(Context ctx) {
+        String ip = ctx.ip();
+        if (ip != null && (ip.equals("127.0.0.1") || ip.equals("::1") || ip.equals("0:0:0:0:0:0:0:1") || ip.equals("[0:0:0:0:0:0:0:1]"))) {
+            String cf = ctx.header("CF-Connecting-IP");
+            if (cf != null && !cf.isBlank()) return cf.trim();
+        }
+        return ip;
     }
 
     private boolean isRequiredPluginAvailable() {
         return Globals.PLUGIN_MANAGER.getPlugin(REQUIRED_PLUGIN_ID) != null;
     }
 
-    private CommandContext executeCommand(String command) {
+    private CommandContext executeCommand(String command, Context http) {
         var context = CommandContext.create(command, PPApiCommandSource.INSTANCE);
-        LOG.info("PP API executed command: {}", command);
+        UserTokens.Identity identity = http.attribute(IDENTITY_ATTR);
+        LOG.info("PP API executed command: {} (token: {}, ip: {})", command,
+            identity == null ? "?" : identity.isMaster() ? "master" : identity.playerName(), clientIp(http));
         Globals.COMMAND.execute(context);
         context.getSource().logEmbed(context, context.getEmbed());
         CommandOutputHelper.logMultiLineOutputToTerminal(context.getMultiLineOutput());
@@ -161,78 +258,69 @@ public class PPApiServer {
         return context;
     }
 
-    private ConfigPearlResult readPearlsFromConfig(String playerName) {
-        var plugin = Globals.PLUGIN_MANAGER.getPlugin(REQUIRED_PLUGIN_ID);
-        if (plugin == null) {
-            return new ConfigPearlResult(List.of(), List.of(), "PearlPlus plugin is not loaded");
-        }
-        try {
-            var pluginClass = plugin.getClass();
-            var configField = pluginClass.getDeclaredField("PLUGIN_CONFIG");
-            configField.setAccessible(true);
-            var config = configField.get(null);
-            if (config == null) {
-                return new ConfigPearlResult(List.of(), List.of(), "PearlPlus config not available");
+    /** What PearlPlus knows about one player, read by reflection (works with duccss PearlPlus and PearlPlus-ng). */
+    private record PearlSnapshot(List<String> pearls, String playerDefault, String globalDefault,
+                                 String loadCommand, String error) {
+        /** Player default, then global default (if the player owns it), then their only pearl. */
+        String resolveDefault() {
+            for (String candidate : new String[] {playerDefault, globalDefault}) {
+                if (candidate == null || candidate.isBlank()) continue;
+                for (String p : pearls) if (p.equalsIgnoreCase(candidate)) return p;
             }
-            var playersField = config.getClass().getDeclaredField("players");
-            playersField.setAccessible(true);
-            var playersObj = playersField.get(config);
-            if (!(playersObj instanceof java.util.Map<?, ?> players)) {
-                return new ConfigPearlResult(List.of(), List.of(), "PearlPlus config players map missing");
-            }
-            Set<String> pearls = new LinkedHashSet<>();
-            for (var entry : players.values()) {
-                if (entry == null) {
-                    continue;
-                }
-                var entryClass = entry.getClass();
-                var nameField = entryClass.getDeclaredField("playerName");
-                nameField.setAccessible(true);
-                var nameObj = nameField.get(entry);
-                if (nameObj == null) {
-                    continue;
-                }
-                var name = nameObj.toString();
-                if (!name.equalsIgnoreCase(playerName)) {
-                    continue;
-                }
-                var pearlsField = entryClass.getDeclaredField("pearls");
-                pearlsField.setAccessible(true);
-                var pearlsObj = pearlsField.get(entry);
-                if (pearlsObj instanceof java.util.Map<?, ?> pearlMap) {
-                    for (var pearlEntry : pearlMap.values()) {
-                        if (pearlEntry == null) {
-                            continue;
-                        }
-                        var pearlIdField = pearlEntry.getClass().getDeclaredField("pearlId");
-                        pearlIdField.setAccessible(true);
-                        var pearlIdObj = pearlIdField.get(pearlEntry);
-                        if (pearlIdObj != null) {
-                            pearls.add(pearlIdObj.toString());
-                        }
-                    }
-                    if (pearlMap.isEmpty()) {
-                        for (var key : pearlMap.keySet()) {
-                            if (key != null) {
-                                pearls.add(key.toString());
-                            }
-                        }
-                    }
-                }
-            }
-            List<String> output = List.of("Loaded pearls from PearlPlus config");
-            return new ConfigPearlResult(new ArrayList<>(pearls), output, null);
-        } catch (ReflectiveOperationException e) {
-            LOG.error("Failed to read PearlPlus config", e);
-            return new ConfigPearlResult(List.of(), List.of(), "Failed to read PearlPlus config");
+            return pearls.size() == 1 ? pearls.get(0) : null;
         }
     }
 
-    private record ConfigPearlResult(
-        List<String> pearls,
-        List<String> output,
-        String error
-    ) { }
+    /** Reads a field by reflection; pass a Class for static fields. Returns null if it does not exist. */
+    private static Object field(Object target, String name) {
+        if (target == null) return null;
+        Class<?> c = target instanceof Class<?> cls ? cls : target.getClass();
+        Object instance = target instanceof Class<?> ? null : target;
+        try {
+            var f = c.getDeclaredField(name);
+            f.setAccessible(true);
+            return f.get(instance);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    private PearlSnapshot readPearlPlus(String playerName) {
+        var plugin = Globals.PLUGIN_MANAGER.getPlugin(REQUIRED_PLUGIN_ID);
+        if (plugin == null) {
+            return new PearlSnapshot(List.of(), null, null, null, "PearlPlus plugin is not loaded");
+        }
+        Object config = field(plugin.getClass(), "PLUGIN_CONFIG");
+        if (config == null) {
+            return new PearlSnapshot(List.of(), null, null, null, "PearlPlus config not available");
+        }
+        if (!(field(config, "players") instanceof java.util.Map<?, ?> players)) {
+            return new PearlSnapshot(List.of(), null, null, null, "PearlPlus config players map missing");
+        }
+        Object globalDefault = field(config, "defaultPearlId");
+        Object loadCommand = field(field(config, "autoLoad"), "loadCommand");
+        Set<String> pearls = new LinkedHashSet<>();
+        String playerDefault = null;
+        for (var entry : players.values()) {
+            Object name = field(entry, "playerName");
+            if (name == null || !name.toString().equalsIgnoreCase(playerName)) continue;
+            Object def = field(entry, "defaultPearlId");
+            if (def != null && playerDefault == null) playerDefault = def.toString();
+            if (field(entry, "pearls") instanceof java.util.Map<?, ?> pearlMap) {
+                for (var e : pearlMap.entrySet()) {
+                    Object id = field(e.getValue(), "pearlId");
+                    if (id == null) id = e.getKey();
+                    if (id != null) pearls.add(id.toString());
+                }
+            }
+        }
+        List<String> sorted = new ArrayList<>(pearls);
+        sorted.sort(String.CASE_INSENSITIVE_ORDER);
+        return new PearlSnapshot(sorted, playerDefault,
+            globalDefault == null ? null : globalDefault.toString(),
+            loadCommand == null || loadCommand.toString().isBlank() ? "load" : loadCommand.toString(),
+            null);
+    }
 
     private BotInfo readZenithBotInfo() {
         String server = null;
